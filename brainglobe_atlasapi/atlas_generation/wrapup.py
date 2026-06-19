@@ -6,11 +6,17 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import brainglobe_space as bgs
+import dask.array as da
 import meshio as mio
 import ngff_zarr as nz
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+import treelib
+import zarr
+from numba.core import types
+from numba.typed import Dict as TypedDict
+from tqdm import tqdm
 
 from brainglobe_atlasapi import atlas_generation, descriptors
 from brainglobe_atlasapi.atlas_generation.atlas_packaging_data import (
@@ -24,7 +30,9 @@ from brainglobe_atlasapi.atlas_generation.metadata_utils import (
     generate_metadata_dict,
 )
 from brainglobe_atlasapi.atlas_generation.stacks import (
+    BG_OME_ZARR_AXES,
     save_annotation,
+    save_annotation_masks,
     save_hemispheres,
     save_template,
     write_multiscale_ome_zarr,
@@ -33,11 +41,20 @@ from brainglobe_atlasapi.atlas_generation.validate_atlases import (
     get_all_validation_functions,
     report_validation_results,
 )
+from brainglobe_atlasapi.atlas_generation.volume_utils import (
+    create_masked_array_numba,
+)
 from brainglobe_atlasapi.bg_atlas import BrainGlobeAtlas
 from brainglobe_atlasapi.descriptors import (
+    ANNOTATION_DTYPE,
+    V3_ANNOTATION_MAP_NAME,
     Resolution,
     ResolutionList,
     ValidComponentData,
+)
+from brainglobe_atlasapi.structure_tree_util import (
+    get_structures_tree,
+    postorder_depth_first_search,
 )
 from brainglobe_atlasapi.utils import atlas_name_from_repr
 
@@ -74,6 +91,7 @@ def _insert_into_multiscale(
     transformations: List[List[dict]],
     new_data: List[npt.NDArray],
     working_dir: Path,
+    axes: List[dict] = BG_OME_ZARR_AXES,
 ) -> None:
     requested_resolutions = [
         tuple(transform[0]["scale"]) for transform in transformations
@@ -108,6 +126,7 @@ def _insert_into_multiscale(
         images=stack_list,
         output_path=working_dir,
         transformations=new_transformations,
+        axes=axes,
     )
 
 
@@ -345,6 +364,213 @@ def _save_annotation_data(
     return annotation_multiscale, hemispheres_multiscale
 
 
+def _generate_annotation_mapping(tree: treelib.Tree) -> Dict[int, int]:
+    """Return {structure_id: index} in post-order (leaves first)."""
+    return {
+        node.identifier: i
+        for i, node in enumerate(postorder_depth_first_search(tree))
+    }
+
+
+def _compute_4d_masks_for_scale(
+    annotation_scale: npt.NDArray,
+    structures_tree: treelib.Tree,
+    mapping: Dict[int, int],
+    scratch_path: Path,
+) -> da.Array:
+    """Compute (N, Z, Y, X) uint8 mask array for one annotation scale level.
+
+    Masks are streamed into an on-disk scratch zarr (one structure per chunk)
+    rather than held in memory. During the post-order walk each structure's
+    children are read back from the scratch store, so peak memory is a few
+    (Z, Y, X) masks regardless of the number of structures. Returns a lazy
+    dask handle backed by ``scratch_path``; the caller owns that path and must
+    keep it alive until the handle has been computed.
+    """
+    n_structures = len(mapping)
+    typed_dict = TypedDict.empty(
+        key_type=types.uint32,
+        value_type=types.uint32,
+    )
+    for k, v in mapping.items():
+        typed_dict[types.uint32(k)] = types.uint32(v)
+
+    z, y, x = annotation_scale.shape
+    masks = zarr.open_array(
+        scratch_path,
+        mode="w",
+        shape=(n_structures, z, y, x),
+        chunks=(1, 256, 256, 256),
+        dtype=descriptors.ANNOTATION_MASKS_DTYPE,
+    )
+
+    flat_vol = annotation_scale.ravel()
+
+    for annotation_id, index in tqdm(
+        mapping.items(), desc="Processing annotations"
+    ):
+        # Get labels for region and it's children
+        stree = structures_tree.subtree(annotation_id)
+        ids = np.asarray(list(stree.nodes.keys()))
+        mapped_ids = np.array([mapping[id_] for id_ in ids])
+
+        lut = np.zeros(int(mapped_ids.max()) + 1, dtype=np.uint8)
+        lut[mapped_ids] = 1
+
+        mask = np.empty(annotation_scale.size, dtype=np.uint8)
+
+        create_masked_array_numba(flat_vol, lut, mask, typed_dict)
+
+        masks[index, ...] = mask.reshape(annotation_scale.shape)
+
+    return da.from_zarr(scratch_path)
+
+
+def _save_4d_annotation_data(
+    packaging_data: AtlasPackagingData,
+    transformations: List[List[dict]],
+) -> None:
+    """Write the 4D annotation masks array alongside annotations_compressed."""
+    annotation_info = packaging_data.annotation_info
+
+    if annotation_info.use_existing:
+        return
+
+    if annotation_info.update_existing:
+        _insert_into_4d_masks(packaging_data, transformations)
+        return
+
+    dest_dir = packaging_data.working_dir / annotation_info.metadata[
+        "location"
+    ].lstrip("/")
+
+    structures_tree = get_structures_tree(packaging_data.structures_list)
+    mapping = _generate_annotation_mapping(structures_tree)
+
+    transformations_4d = [
+        [{"type": "scale", "scale": [1.0] + t[0]["scale"]}]
+        for t in transformations
+    ]
+
+    masks_path = dest_dir / descriptors.V3_ANNOTATION_MASKS_NAME
+    scratch_dir = dest_dir / ".mask_scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        masks_per_scale = [
+            _compute_4d_masks_for_scale(
+                ann_scale,
+                structures_tree,
+                mapping,
+                scratch_dir / f"scale_{i}.zarr",
+            )
+            for i, ann_scale in enumerate(packaging_data.annotation_stack)
+        ]
+        save_annotation_masks(masks_per_scale, dest_dir, transformations_4d)
+
+        root = zarr.open_group(masks_path, mode="r+")
+
+        sorted_mapping_list = np.zeros(len(mapping), dtype=ANNOTATION_DTYPE)
+
+        for annotation_id, array_ind in mapping.items():
+            sorted_mapping_list[array_ind] = annotation_id
+
+        root[V3_ANNOTATION_MAP_NAME] = sorted_mapping_list
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _insert_into_4d_masks(
+    packaging_data: AtlasPackagingData,
+    transformations: List[List[dict]],
+) -> None:
+    """Insert new resolution levels into an existing annotations.ome.zarr.
+
+    Reads the existing zarr from the previous version's directory, validates
+    that the annotation_mapping is unchanged, computes 4D masks for the new
+    scales, merges all scale levels, and writes to the new versioned directory.
+    """
+    annotation_info = packaging_data.annotation_info
+    existing_masks_path = (
+        packaging_data.working_dir
+        / Path(annotation_info.existing_stub).parent
+        / descriptors.V3_ANNOTATION_MASKS_NAME
+    )
+    target_dir = packaging_data.working_dir / Path(annotation_info.stub).parent
+    target_masks_path = target_dir / descriptors.V3_ANNOTATION_MASKS_NAME
+
+    if not existing_masks_path.exists():
+        raise ValueError(
+            f"No existing 4D masks zarr found at {existing_masks_path}. "
+            "This atlas may predate the 4D masks feature — "
+            "re-run without update_existing to build from scratch."
+        )
+
+    existing_root = zarr.open_group(existing_masks_path, mode="r")
+    raw_mapping = existing_root[V3_ANNOTATION_MAP_NAME][:]
+    stored_mapping = {
+        int(annotation_id): array_ind
+        for array_ind, annotation_id in enumerate(raw_mapping)
+    }
+
+    structures_tree = get_structures_tree(packaging_data.structures_list)
+    expected_mapping = _generate_annotation_mapping(structures_tree)
+
+    if stored_mapping != expected_mapping:
+        raise ValueError(
+            "The annotation_mapping in the existing 4D masks zarr does not "
+            "match the structures_list for this atlas version. "
+            "Re-run without update_existing to rebuild from scratch."
+        )
+
+    existing_multiscale = nz.from_ngff_zarr(existing_masks_path)
+    resolution_to_data: Dict[tuple, da.Array] = {
+        tuple(im.scale.values())[1:]: im.data
+        for im in existing_multiscale.images
+    }
+
+    new_resolutions = [tuple(t[0]["scale"]) for t in transformations]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir = target_dir / ".mask_scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for i, (res, annotation_scale) in enumerate(
+            zip(new_resolutions, packaging_data.annotation_stack)
+        ):
+            resolution_to_data[res] = _compute_4d_masks_for_scale(
+                annotation_scale,
+                structures_tree,
+                expected_mapping,
+                scratch_dir / f"scale_{i}.zarr",
+            )
+
+        existing_resolutions = [
+            tuple(im.scale.values())[1:] for im in existing_multiscale.images
+        ]
+        merged_resolutions = _merge_resolutions_list(
+            existing_resolutions, new_resolutions
+        )
+
+        merged_stack = [resolution_to_data[res] for res in merged_resolutions]
+        transformations_4d = [
+            [{"type": "scale", "scale": [1.0] + list(res)}]
+            for res in merged_resolutions
+        ]
+
+        save_annotation_masks(merged_stack, target_dir, transformations_4d)
+
+        new_root = zarr.open_group(target_masks_path, mode="r+")
+
+        sorted_mapping_list = np.zeros(
+            len(expected_mapping), dtype=ANNOTATION_DTYPE
+        )
+        for annotation_id, array_ind in expected_mapping.items():
+            sorted_mapping_list[array_ind] = annotation_id
+
+        new_root[V3_ANNOTATION_MAP_NAME] = sorted_mapping_list
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
 def _save_additional_references(
     packaging_data: AtlasPackagingData,
     transformations: List[List[dict]],
@@ -414,7 +640,7 @@ def _finalize_atlas_at_resolution(
     ]
 
     metadata_dict = generate_metadata_dict(
-        name=atlas_name_with_res,
+        name=atlas_name,
         location=atlas_location,
         citation=packaging_data.citation,
         atlas_link=packaging_data.atlas_link,
@@ -632,7 +858,7 @@ def wrapup_atlas_from_data(
 
     if coordinate_space_info is None:
         coordinate_space_info = {
-            "name": f"{atlas_name}-coordinate-space",
+            "name": f"{atlas_name}-space",
             "version": atlas_version,
         }
 
@@ -724,13 +950,34 @@ def wrapup_atlas_from_data(
         transformations,
     )
 
-    shapes = [image.data.shape for image in template_multiscale.images]
+    shapes = {}
+
+    for resolution in packaging_data.resolution:
+        # Find the closest matching resolution in the template multiscale
+        template_resolutions = [
+            tuple(im.scale.values()) for im in template_multiscale.images
+        ]
+        closest_template_idx = np.argmin(
+            [
+                np.linalg.norm(np.array(res) * 1000 - np.array(resolution))
+                for res in template_resolutions
+            ]
+        )
+        closest_template_shape = template_multiscale.images[
+            closest_template_idx
+        ].data.shape
+        shapes[resolution] = closest_template_shape
 
     _save_annotation_data(
         packaging_data,
         transformations,
         scale_meshes,
         resolution_mapping,
+    )
+
+    _save_4d_annotation_data(
+        packaging_data,
+        transformations,
     )
 
     _save_additional_references(
@@ -755,7 +1002,8 @@ def wrapup_atlas_from_data(
             coordinate_space_info.metadata, coordinate_space_path
         )
 
-    for resolution, shape in zip(packaging_data.resolution, shapes):
+    for resolution in packaging_data.resolution:
+        shape = shapes[resolution]
         _finalize_atlas_at_resolution(
             resolution=resolution,
             shape=shape,
