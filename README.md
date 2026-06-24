@@ -1,4 +1,4 @@
-[![Docs](https://img.shields.io/badge/Docs-brainglobe-atlasapi-blue)](https://brainglobe.info/documentation/brainglobe-atlasapi/index.html)
+[![Docs](https://img.shields.io/badge/Docs-brainglobe--atlasapi-blue)](https://brainglobe.info/documentation/brainglobe-atlasapi/index.html)
 [![Get in Touch](https://img.shields.io/badge/Get%20in%20Touch-BrainGlobe-blue)](https://brainglobe.info/contact.html)
 [![DOI](https://joss.theoj.org/papers/10.21105/joss.02668/status.svg)](https://doi.org/10.21105/joss.02668)
 [![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
