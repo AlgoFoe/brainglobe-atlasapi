@@ -1,13 +1,3 @@
-# brainglobe-atlasapi
-
-[![Python Version](https://img.shields.io/pypi/pyversions/brainglobe-atlasapi.svg)](https://pypi.org/project/brainglobe-atlasapi)
-[![PyPI](https://img.shields.io/pypi/v/brainglobe-atlasapi.svg)](https://pypi.org/project/brainglobe-atlasapi/)
-[![Anaconda version](https://anaconda.org/conda-forge/brainglobe-atlasapi/badges/version.svg)](https://anaconda.org/conda-forge/brainglobe-atlasapi)
-[![Wheel](https://img.shields.io/pypi/wheel/brainglobe-atlasapi.svg)](https://pypi.org/project/brainglobe-atlasapi)
-[![Development Status](https://img.shields.io/pypi/status/brainatlas-api.svg)](https://github.com/SainsburyWellcomeCentre/brainatlas-api)
-[![Downloads](https://pepy.tech/badge/brainglobe-atlasapi)](https://pepy.tech/project/brainglobe-atlasapi)
-[![Tests](https://img.shields.io/github/actions/workflow/status/brainglobe/brainglobe-atlasapi/test_and_deploy.yml?branch=main)](
-    https://github.com/brainglobe/brainglobe-atlasapi/actions)
 [![Docs](https://img.shields.io/badge/Docs-brainglobe-atlasapi-blue)](https://brainglobe.info/documentation/brainglobe-atlasapi/index.html)
 [![Get in Touch](https://img.shields.io/badge/Get%20in%20Touch-BrainGlobe-blue)](https://brainglobe.info/contact.html)
 [![DOI](https://joss.theoj.org/papers/10.21105/joss.02668/status.svg)](https://doi.org/10.21105/joss.02668)
@@ -19,8 +9,11 @@
 [![Conda](https://anaconda.org/conda-forge/brainglobe-atlasapi/badges/version.svg)](https://anaconda.org/conda-forge/brainglobe-atlasapi)
 [![Downloads](https://static.pepy.tech/badge/brainglobe-atlasapi)](https://pepy.tech/project/brainglobe-atlasapi)
 [![Code Style: Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/format.json)](https://github.com/astral-sh/ruff)
-[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-green?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
+[![Pre-commit](https://img.shields.io/badge/pre--commit-enabled-green?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
 [![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-green.svg)](https://brainglobe.info/community/developers/index.html)
+
+# brainglobe-atlasapi
+
 The BrainGlobe Atlas API (`brainglobe-atlasapi`) provides a common interface for programmers to download and process brain atlas data from multiple sources.
 
 ## Atlases available
